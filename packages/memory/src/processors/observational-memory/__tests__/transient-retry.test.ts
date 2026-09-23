@@ -24,7 +24,7 @@ type StreamPart =
   | { type: 'tool-call'; toolCallId: string; toolName: string; input: string }
   | {
       type: 'finish';
-      finishReason: 'stop' | 'tool-calls';
+      finishReason: 'stop' | 'tool-calls' | 'other';
       usage: { inputTokens: number; outputTokens: number; totalTokens: number };
     };
 
@@ -239,6 +239,64 @@ function createFlakyObserverModel(
   };
 }
 
+/**
+ * Observer model whose first stream closes early: partial text, then
+ * `finishReason: 'other'` (what Gemini reports when a stream is cut off).
+ * Records the role of the last prompt message for every call.
+ */
+function createTruncatingObserverModel(observationsText: string) {
+  let callCount = 0;
+  const lastRoles: string[] = [];
+
+  return {
+    specificationVersion: 'v2' as const,
+    provider: 'mock-truncating-observer',
+    modelId: 'mock-truncating-observer-model',
+    defaultObjectGenerationMode: undefined,
+    supportsImageUrls: false,
+    supportedUrls: {},
+
+    get __lastRoles() {
+      return lastRoles;
+    },
+
+    async doStream({ prompt }: { prompt: Array<{ role: string }> }) {
+      callCount++;
+      lastRoles.push(prompt[prompt.length - 1]!.role);
+      const truncated = callCount === 1;
+
+      const parts: StreamPart[] = [
+        { type: 'stream-start', warnings: [] },
+        {
+          type: 'response-metadata',
+          id: `obs-${callCount}`,
+          modelId: 'mock-truncating-observer-model',
+          timestamp: new Date(),
+        },
+        { type: 'text-start', id: 'text-1' },
+        { type: 'text-delta', id: 'text-1', delta: truncated ? observationsText.slice(0, 30) : observationsText },
+        { type: 'text-end', id: 'text-1' },
+        {
+          type: 'finish',
+          finishReason: truncated ? 'other' : 'stop',
+          usage: { inputTokens: 100, outputTokens: 50, totalTokens: 150 },
+        },
+      ];
+
+      return {
+        stream: new ReadableStream({
+          start(controller) {
+            for (const p of parts) controller.enqueue(p);
+            controller.close();
+          },
+        }),
+        rawCall: { rawPrompt: null, rawSettings: {} },
+        warnings: [],
+      };
+    },
+  };
+}
+
 const omTriggerTool = createTool({
   id: 'test',
   description: 'Trigger tool for OM testing',
@@ -369,5 +427,57 @@ describe('OM transient-error retry', { timeout: 30_000 }, () => {
     expect(result.tripwire).toBeFalsy();
     expect(result.text).toBe(longResponseText);
     expect(observerModel.__observerCallCount).toBeGreaterThan(failuresBeforeSuccess);
+  });
+
+  it('retries an observer stream that ends without a stop reason instead of continuing it', async () => {
+    const store = new InMemoryStore();
+    const observerModel = createTruncatingObserverModel(observationsText);
+
+    const memory = new Memory({
+      storage: store,
+      options: {
+        observationalMemory: {
+          enabled: true,
+          observation: {
+            model: observerModel as any,
+            messageTokens: 20,
+            bufferTokens: false,
+          },
+          reflection: {
+            observationTokens: 50_000,
+          },
+        },
+      },
+    });
+
+    const agent = new Agent({
+      id: 'truncated-observer-test-agent',
+      name: 'Truncated Observer Test Agent',
+      instructions: 'You are a helpful assistant. Always use the test tool first.',
+      model: createMockActorModel(longResponseText) as any,
+      tools: { test: omTriggerTool },
+      memory,
+    });
+
+    const result = await agent.generate('Hello, I need help.', {
+      memory: {
+        thread: 'truncated-observer-thread',
+        resource: 'truncated-observer-resource',
+      },
+    });
+
+    expect(result.text).toBe(longResponseText);
+    // This turn runs two observations. The cut-off first call adds one fresh
+    // retry, never a continuation that ends on the partial assistant turn
+    // (Gemini rejects that with a 400).
+    expect(observerModel.__lastRoles).toEqual(['user', 'user', 'user']);
+
+    const memoryStore = await store.getStore('memory');
+    const record = await memoryStore!.getObservationalMemory(
+      'truncated-observer-thread',
+      'truncated-observer-resource',
+    );
+    expect(record?.activeObservations).toContain('User greeted and asked for help');
+    expect(record?.activeObservations).not.toContain(observationsText.slice(0, 30) + '<observations>');
   });
 });

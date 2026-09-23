@@ -120,6 +120,25 @@ export function isTransientLLMError(error: unknown): boolean {
 }
 
 /**
+ * Throws a retryable error when an OM model call ended without a stop reason.
+ *
+ * A stream that closes early (Gemini reports `other`) leaves partial text. The
+ * agent loop treats that as unfinished and would continue from the partial
+ * reply, so OM runs with `maxSteps: 1` and retries the whole call instead.
+ *
+ * @internal
+ */
+export function assertCompleteModelResponse<T extends { finishReason?: string }>(output: T, label: string): T {
+  const reason = output.finishReason;
+  if (reason === 'other' || reason === 'unknown') {
+    throw Object.assign(new Error(`${label} response ended without a stop reason (${String(reason)})`), {
+      isRetryable: true,
+    });
+  }
+  return output;
+}
+
+/**
  * Compute the backoff delay (ms) for the Nth retry (0-indexed).
  *
  * Exponential growth (`initialDelayMs * backoffFactor^attempt`) capped at
