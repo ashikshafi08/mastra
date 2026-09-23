@@ -467,9 +467,8 @@ describe('OM transient-error retry', { timeout: 30_000 }, () => {
     });
 
     expect(result.text).toBe(longResponseText);
-    // This turn runs two observations. The cut-off first call adds one fresh
-    // retry, never a continuation that ends on the partial assistant turn
-    // (Gemini rejects that with a 400).
+    // Two observations in this turn, plus one retry of the cut-off call. None of
+    // them continues from the partial assistant turn.
     expect(observerModel.__lastRoles).toEqual(['user', 'user', 'user']);
 
     const memoryStore = await store.getStore('memory');
@@ -478,6 +477,6 @@ describe('OM transient-error retry', { timeout: 30_000 }, () => {
       'truncated-observer-resource',
     );
     expect(record?.activeObservations).toContain('User greeted and asked for help');
-    expect(record?.activeObservations).not.toContain(observationsText.slice(0, 30) + '<observations>');
+    expect(record?.activeObservations).not.toContain('<observations>');
   });
 });
